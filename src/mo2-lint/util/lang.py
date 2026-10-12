@@ -83,14 +83,19 @@ def prompt_prefix_init() -> bool:
 
     match state.current_instance.launcher:
         case "steam":
+            # The MO2 compatibility tool is only created at the end of the installation,
+            # so the prefix has to be set up with the Proton version it wraps.
+            proton_version = state.current_instance.proton_wrapper.proton_version
             instructions = f"""Before continuing, please ensure your Steam prefix is set up correctly:
 
   1. Right-click on the game in your Steam library.
   2. Select 'Properties', and navigate to the 'Compatibility' tab.
   3. Check the box for 'Force the use of a specific Steam Play compatibility tool', if it's not already checked.
-  4. From the dropdown menu, select the custom MO2 Proton tool created by this installer (named 'MO2 {state.current_instance.game}' or the value from --proton-version if you changed it).
+  4. From the dropdown menu, select '{proton_version}' (specify --proton-version when installing to change this).
   5. If you haven't already, launch the game once to allow Steam to set up the prefix, then exit completely.
-  6. Do not launch the game again until the installation process is finished."""
+  6. Do not launch the game again until the installation process is finished.
+
+  The 'MO2 {var.game_info.display_name}' compatibility tool is created at the end of the installation. You will be asked to select it then."""
         case "gog" | "epic":
             instructions = """Before continuing, please ensure your Heroic prefix is set up correctly:
 

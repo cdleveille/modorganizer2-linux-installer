@@ -417,7 +417,9 @@ def main(argv: list[str]) -> int:
             f"Launching: {mo2_exe}"
             + (f" with args: {other_args}" if other_args else "")
         )
-        return execute_mo2(mo2_exe, other_args)
+        exit_code = execute_mo2(mo2_exe, other_args)
+        logger.info(f"Mod Organizer 2 exited with code {exit_code} ({exit_code:#x})")
+        return exit_code
 
     except Exception as e:
         logger.error(f"Redirector error: {e}")

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import shutil
+import struct
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -13,6 +15,8 @@ from util.download import download
 from util.heroic.find_library import get_data as get_heroic_data
 from util.wine import protontricks, winetricks
 
+from shared import host
+
 default_tricks = [
     "win10",
     "arial",
@@ -20,6 +24,23 @@ default_tricks = [
 ]
 
 yes = ("", "y", "yes")
+
+vcrun_dlls = [
+    "concrt140",
+    "msvcp140",
+    "msvcp140_1",
+    "msvcp140_2",
+    "msvcp140_atomic_wait",
+    "msvcp140_codecvt_ids",
+    "vcamp140",
+    "vccorlib140",
+    "vcomp140",
+    "vcruntime140",
+    "vcruntime140_1",
+]
+
+# Suffix of each architecture's DLL file names inside the VC++ Redistributable cabinets
+vcredist_suffixes = {"x86": "_x86", "x64": "_amd64"}
 
 
 def get_default_tricks() -> list[str]:
@@ -97,28 +118,150 @@ def _run_vcredist_installer(installer_path: Path, app_id: int | None = None):
             winetricks.run(
                 winetricks_path, prefix, [f"wine {installer_path} /quiet /norestart"]
             )
-    except SystemExit:
-        logger.info(
-            "vcredist installer finished (exit code indicates reboot or already installed)."
+    except SystemExit as error:
+        logger.warning(
+            f"{installer_path.name} exited with code {error.code}, it may not have installed anything."
         )
+
+
+def _windows_dir() -> Path | None:
+    """
+    Gets the Windows directory of the current prefix.
+    Proton prefixes keep drive_c under pfx/, Wine prefixes do not.
+    """
+    for drive_c in (var.prefix / "pfx" / "drive_c", var.prefix / "drive_c"):
+        if drive_c.is_dir():
+            return drive_c / "windows"
+    return None
+
+
+def _is_wine_builtin(path: Path) -> bool:
+    """
+    Checks the DOS stub marker Wine writes into its builtin and placeholder DLLs.
+    """
+    with open(path, "rb") as file:
+        header = file.read(0x80)
+    return b"Wine builtin DLL" in header or b"Wine placeholder DLL" in header
+
+
+def _file_version(path: Path) -> tuple[int, int, int, int] | None:
+    """
+    Reads the file version from a DLL's VS_FIXEDFILEINFO resource.
+    """
+    data = path.read_bytes()
+    index = data.find(b"\xbd\x04\xef\xfe")  # VS_FIXEDFILEINFO signature
+    if index < 0 or index + 16 > len(data):
+        return None
+    most, least = struct.unpack_from("<II", data, index + 8)
+    return (most >> 16, most & 0xFFFF, least >> 16, least & 0xFFFF)
+
+
+def _should_replace(existing: Path, replacement: Path) -> bool:
+    """
+    Replaces missing files, Wine builtins and older native DLLs, never newer native DLLs.
+    """
+    if not existing.exists() or _is_wine_builtin(existing):
+        return True
+    existing_version = _file_version(existing)
+    replacement_version = _file_version(replacement)
+    if existing_version is None:
+        return True
+    return replacement_version is not None and existing_version < replacement_version
+
+
+def _extract_vcredist_dlls(
+    installer_path: Path, arch: str, destination: Path
+) -> list[Path]:
+    """
+    Extracts the VC++ runtime DLLs for one architecture without running the installer.
+    The installer is a WiX bundle whose attached containers (a0, a1, ...) are cabinets.
+    """
+    cabextract = shutil.which("cabextract")
+    if not cabextract:
+        logger.error("cabextract not found, cannot extract the VC++ runtime DLLs.")
+        return []
+
+    suffix = vcredist_suffixes[arch]
+    containers = destination / "containers"
+    subprocess.run(
+        [cabextract, "-q", "-d", str(containers), "-F", "a*", str(installer_path)],
+        capture_output=True,
+        check=False,
+    )
+    for container in sorted(containers.glob("a*")):
+        subprocess.run(
+            [
+                cabextract,
+                "-q",
+                "-d",
+                str(destination),
+                "-F",
+                f"*.dll{suffix}",
+                str(container),
+            ],
+            capture_output=True,
+            check=False,
+        )
+
+    return [
+        destination / f"{dll}.dll{suffix}"
+        for dll in vcrun_dlls
+        if (destination / f"{dll}.dll{suffix}").is_file()
+    ]
+
+
+def _install_vcredist_dlls(installer_path: Path, arch: str):
+    """
+    Copies the VC++ runtime DLLs from a VC++ Redistributable installer into the prefix.
+
+    The installer alone is not reliable under Proton: it can fail before installing anything
+    ("Failed to initialize theme manager"), and it skips msvcp140 when Wine's builtin reports
+    a higher version (https://bugs.winehq.org/show_bug.cgi?id=57518). Mod Organizer 2 crashes
+    on start with an older runtime, such as the 2015 runtime Steam installs for some games.
+    """
+    if host.is_arm64():
+        logger.debug("Skipping direct VC++ runtime DLL install on ARM64")
+        return
+
+    windows = _windows_dir()
+    if not windows:
+        logger.error(
+            f"Could not find the Windows directory in prefix {var.prefix}, skipping direct VC++ runtime DLL install."
+        )
+        return
+
+    syswow64 = windows / "syswow64"
+    if arch == "x64":
+        if not syswow64.is_dir():
+            logger.debug("Prefix is 32-bit, skipping 64-bit VC++ runtime DLLs")
+            return
+        target_dir = windows / "system32"
+    else:
+        target_dir = syswow64 if syswow64.is_dir() else windows / "system32"
+
+    with tempfile.TemporaryDirectory(prefix="mo2-lint-vcredist-") as temp:
+        dlls = _extract_vcredist_dlls(installer_path, arch, Path(temp))
+        if not dlls:
+            logger.error(
+                f"Could not extract VC++ runtime DLLs from {installer_path}. Mod Organizer 2 may fail to start."
+            )
+            return
+
+        for source in dlls:
+            target = target_dir / source.name.removesuffix(vcredist_suffixes[arch])
+            if not _should_replace(target, source):
+                logger.trace(f"Keeping {target}, it is up to date")
+                continue
+            # Unlink first so a symlinked DLL never writes through into a Proton install
+            target.unlink(missing_ok=True)
+            shutil.copyfile(source, target)
+            logger.debug(f"Installed {target.name} to {target_dir}")
+
+    logger.info(f"VC++ runtime DLLs ({arch}) are up to date in {target_dir}")
 
 
 def _set_vcredist_overrides(app_id: int | None = None):
     """Set DLL overrides for all VC++ runtime libraries."""
-    vcrun_dlls = [
-        "concrt140",
-        "msvcp140",
-        "msvcp140_1",
-        "msvcp140_2",
-        "msvcp140_atomic_wait",
-        "msvcp140_codecvt_ids",
-        "vcamp140",
-        "vccorlib140",
-        "vcomp140",
-        "vcruntime140",
-        "vcruntime140_1",
-    ]
-
     logger.info("Setting DLL overrides for VC++ runtime libraries...")
     if app_id is not None:
         for dll in vcrun_dlls:
@@ -164,6 +307,7 @@ def install_vcredist():
         if installer_path:
             logger.info(f"Installing VC++ Redistributable ({arch})...")
             _run_vcredist_installer(installer_path, app_id)
+            _install_vcredist_dlls(installer_path, arch)
         else:
             logger.error(f"Failed to download vcredist {arch} installer.")
 
